@@ -29,6 +29,29 @@ Common root keys: model, method, domain, ids, values, fields, limit, offset, ord
 
 Domains follow standard Odoo syntax (list of triplets / logical operators). Examples are compacted single-line for readability.
 
+### 2.4 Content-Type support (custom code mode)
+When `can_code` is enabled, the inbound endpoint accepts any textual Content-Type and converts the body to a dict exposed as `request['json']`:
+
+| Content-Type | request['json'] |
+|---|---|
+| `application/json` (+ `; charset=`) | parsed JSON dict |
+| `application/*+json` (e.g. `vnd.api+json`) | parsed JSON dict |
+| `application/x-www-form-urlencoded` | dict; values that look like JSON are decoded, repeated keys become lists |
+| `multipart/form-data` | dict of form fields; uploads in `request['files']` (metadata) and `request['files_data']` (bytes) |
+| `application/xml`, `text/xml`, `*+xml` | dict converted from XML (attributes `@attr`, repeated tags as lists) |
+| `text/plain` | parsed JSON if possible, otherwise `{'body': <raw text>}` |
+| `application/octet-stream` / others | stays raw in `request['body']` (not converted) |
+
+`Content-Encoding: gzip` / `deflate` bodies are decompressed before parsing. Parsing failures never block custom code: details go to `request['parse_error']`, and the original `Content-Type` is available at `request['content_type']`.
+
+Example (form-urlencoded):
+```bash
+curl -X POST -H "Authorization: Bearer <secret_key>" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode 'values={"name":"Cliente X"}' \
+  http://localhost:8069/bitconn/webhook/<webhook_uuid>
+```
+
 ## 3. Quick inline examples
 
 Create

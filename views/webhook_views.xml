@@ -137,7 +137,7 @@
                   <br/>
                   <strong>💡 Tip:</strong> See the <strong>Help</strong> tab for complete documentation and available variables.
                 </div>
-                <field name="python_code" nolabel="1" widget="code" options="{'mode': 'python', 'lineWrapping': true, 'lineNumbers': true}" invisible="can_code == False" placeholder="# Available variables: request, env, user_id, json&#10;# Set result variable to return response&#10;&#10;# Example: Create a partner from webhook data&#10;data = request['json']&#10;partner = env['res.partner'].create({&#10;    'name': data.get('name'),&#10;    'email': data.get('email')&#10;})&#10;result = {'ok': True, 'partner_id': partner.id, 'name': partner.name}"/>
+                <field name="python_code" nolabel="1" widget="code" options="{'mode': 'python', 'lineWrapping': true, 'lineNumbers': true}" invisible="can_code == False" placeholder="# Available variables: request, env, user_id, json&#10;# Set result variable to return response&#10;# request['json'] is a dict for ALL content types (JSON, form, XML, text/plain)&#10;# request['content_type'] and request['parse_error'] are always available&#10;# request['files'] / request['files_data'] expose multipart uploads&#10;&#10;# Example: Create a partner from webhook data&#10;data = request['json']&#10;partner = env['res.partner'].create({&#10;    'name': data.get('name'),&#10;    'email': data.get('email')&#10;})&#10;result = {'ok': True, 'partner_id': partner.id, 'name': partner.name}"/>
                 
                 <separator string="Request Monitor (Real-time)" invisible="can_code == False"/>
                 <div class="text-muted mb-2" invisible="can_code == False">
@@ -269,6 +269,7 @@
                     <field name="direction" widget="badge" decoration-success="direction == 'inbound'" decoration-info="direction == 'outbound'"/>
                     <field name="state" widget="badge" decoration-success="state == 'success'" decoration-danger="state == 'error'"/>
                     <field name="http_method"/>
+                    <field name="content_type" optional="show"/>
                     <field name="model_name"/>
                     <field name="method"/>
                     <field name="execution_date"/>
@@ -285,6 +286,7 @@
                         <field name="duration"/>
                         <field name="http_method"/>
                         <field name="http_status"/>
+                        <field name="content_type"/>
                       </group>
                     </group>
                     <group>
@@ -315,9 +317,13 @@
                     <h5><code>request</code> - Request object</h5>
                     <ul>
                       <li><code>request['body']</code> - Raw request body as string. Use for signature validation, XML parsing, or when you need the original text.</li>
-                      <li><code>request['json']</code> - Parsed JSON body as Python dict. Most convenient for accessing request data.</li>
+                      <li><code>request['json']</code> - Parsed body as Python dict. Works for <strong>all</strong> textual Content-Types: JSON, form-urlencoded, multipart (fields), XML and text/plain are auto-converted to a dict.</li>
                       <li><code>request['headers']</code> - Request headers as dict. Access with <code>request['headers'].get('Content-Type')</code></li>
                       <li><code>request['method']</code> - HTTP method (GET, POST, PUT, PATCH, DELETE). Use to route different logic based on method.</li>
+                      <li><code>request['content_type']</code> - Original Content-Type header (e.g. <code>application/x-www-form-urlencoded</code>).</li>
+                      <li><code>request['parse_error']</code> - Error message if body parsing failed (never blocks the code; <code>None</code> on success).</li>
+                      <li><code>request['files']</code> - Multipart uploaded files as metadata dict: <code>{'file': {'filename': ..., 'content_type': ..., 'size': ...}}</code>.</li>
+                      <li><code>request['files_data']</code> - Multipart <code>FileStorage</code> objects to read bytes: <code>request['files_data']['file'].read()</code>.</li>
                     </ul>
                     
                     <h5><code>env</code> - Odoo Environment</h5>
@@ -371,6 +377,51 @@ else:
                   </div>
                 </group>
                 
+                <group>
+                  <separator string="Content-Type Support (can_code)"/>
+                </group>
+                <group>
+                  <div class="alert alert-info" role="status">
+                    <h4>📦 Supported Content-Types</h4>
+                    <p>When custom code execution is enabled, the request body is auto-converted to a dict in <code>request['json']</code> for every textual Content-Type:</p>
+                    <table class="table table-sm">
+                      <thead>
+                        <tr><th>Content-Type</th><th>request['json']</th></tr>
+                      </thead>
+                      <tbody>
+                        <tr><td><code>application/json</code> (+ <code>; charset=</code>)</td><td>parsed JSON dict</td></tr>
+                        <tr><td><code>application/*+json</code> (e.g. <code>vnd.api+json</code>)</td><td>parsed JSON dict</td></tr>
+                        <tr><td><code>application/x-www-form-urlencoded</code></td><td>dict; values that look like JSON are decoded, repeated keys become lists</td></tr>
+                        <tr><td><code>multipart/form-data</code></td><td>dict of form fields; uploads in <code>request['files']</code> (metadata) and <code>request['files_data']</code> (bytes)</td></tr>
+                        <tr><td><code>application/xml</code>, <code>text/xml</code>, <code>*+xml</code></td><td>dict converted from XML (attributes <code>@attr</code>, repeated tags as lists)</td></tr>
+                        <tr><td><code>text/plain</code></td><td>parsed JSON if possible, otherwise <code>{'body': raw}</code></td></tr>
+                        <tr><td><code>application/octet-stream</code> / others</td><td>stays raw in <code>request['body']</code> (not converted)</td></tr>
+                      </tbody>
+                    </table>
+                    <p><code>Content-Encoding: gzip</code> / <code>deflate</code> bodies are decompressed before parsing. Parsing failures never block your code: the detail is available at <code>request['parse_error']</code> and the original header at <code>request['content_type']</code>.</p>
+
+                    <h5>Example - Form-urlencoded</h5>
+                    <pre><code>curl -X POST -H "Authorization: Bearer &lt;secret&gt;" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode 'values={"name":"Cliente X"}' \
+  http://localhost:8069/bitconn/webhook/&lt;uuid&gt;
+
+# request['json'] = {'values': {'name': 'Cliente X'}}</code></pre>
+
+                    <h5>Example - Multipart file upload</h5>
+                    <pre><code>import base64
+
+meta = request['files']['file']    # {'filename': ..., 'content_type': ..., 'size': ...}
+content = request['files_data']['file'].read()
+attachment = env['ir.attachment'].create({
+    'name': meta['filename'],
+    'type': 'binary',
+    'datas': base64.b64encode(content),
+})
+result = {'ok': True, 'attachment_id': attachment.id}</code></pre>
+                  </div>
+                </group>
+
                 <group>
                   <separator string="CRUD Operations - Inbound Webhook"/>
                 </group>

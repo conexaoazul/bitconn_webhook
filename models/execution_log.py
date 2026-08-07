@@ -27,6 +27,7 @@ class BitconnWebhookExecutionLog(models.Model):
     error_message = fields.Text(string='Error Message')
     http_method = fields.Char(string='HTTP Method')
     http_status = fields.Integer(string='HTTP Status')
+    content_type = fields.Char(string='Content-Type')
     model_name = fields.Char(string='Model')
     method = fields.Char(string='Method')
     execution_date = fields.Datetime(

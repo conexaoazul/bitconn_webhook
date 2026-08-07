@@ -120,7 +120,7 @@ class BitconnWebhook(models.Model):
     def _create_execution_log(self, direction, state, input_data=None, execution_data=None,
                               output_data=None, error_message=None, http_method=None,
                               http_status=None, model_name=None, method=None,
-                              server_action_id=None, duration=None):
+                              server_action_id=None, duration=None, content_type=None):
         self.ensure_one()
         try:
             self.env['bitconn.webhook.execution.log'].sudo().create({
@@ -134,6 +134,7 @@ class BitconnWebhook(models.Model):
                 'error_message': str(error_message)[:5000] if error_message else None,
                 'http_method': http_method,
                 'http_status': http_status,
+                'content_type': content_type,
                 'model_name': model_name,
                 'method': method,
                 'execution_date': fields.Datetime.now(),
@@ -176,7 +177,13 @@ class BitconnWebhook(models.Model):
 # ==========================================
 # request['body'] - Raw request body as string. Use for signature validation, XML parsing, 
 #                   or when you need the original text.
-# request['json'] - Parsed JSON body as Python dict. Most convenient for accessing request data.
+# request['json'] - Parsed body as dict. Works for ALL textual Content-Types: JSON,
+#                   form-urlencoded, multipart (fields), XML and text/plain are
+#                   auto-converted to a dict.
+# request['content_type'] - Original Content-Type header (e.g. application/x-www-form-urlencoded)
+# request['parse_error']  - Parsing error message if any (None on success; never blocks the code)
+# request['files']        - Multipart uploads metadata: {'file': {'filename','content_type','size'}}
+# request['files_data']   - Multipart FileStorage objects to read bytes: request['files_data']['file'].read()
 # request['headers'] - Request headers as dict. Access with request['headers'].get('Content-Type')
 # request['method'] - HTTP method (GET, POST, PUT, PATCH, DELETE). Use to route different logic 
 #                     based on method.
@@ -1261,7 +1268,9 @@ result = {'ok': True, 'message': 'Code executed successfully'}"""
         })
         return True
 
-    def _exec_code(self, request_raw, request_headers=None, request_method='POST'):
+    def _exec_code(self, request_raw, request_headers=None, request_method='POST',
+                   content_type=None, parsed_payload=None, parse_error=None,
+                   files=None, files_data=None):
         """Execute custom Python code with request object as input"""
         self.ensure_one()
         
@@ -1273,13 +1282,23 @@ result = {'ok': True, 'message': 'Code executed successfully'}"""
             'body': request_raw,
             'headers': request_headers or {},
             'method': request_method,
+            'content_type': content_type,
+            'parse_error': parse_error,
         }
         
-        # Try to parse body as JSON
-        try:
-            request_obj['json'] = json.loads(request_raw) if request_raw else {}
-        except Exception:
-            request_obj['json'] = {}
+        # request['json'] recebe o dict convertido pelo parser universal de Content-Type.
+        # Todo formato textual (json, urlencoded, multipart, xml, text/plain) vira dict.
+        # application/octet-stream e desconhecidos ficam raw em request['body'].
+        if parsed_payload is not None:
+            request_obj['json'] = parsed_payload
+        else:
+            try:
+                request_obj['json'] = json.loads(request_raw) if request_raw else {}
+            except Exception:
+                request_obj['json'] = {}
+        # Arquivos multipart: metadados + objetos FileStorage para leitura
+        request_obj['files'] = files or {}
+        request_obj['files_data'] = files_data or {}
         
         # If pin_request is enabled and no code, just return the request for inspection
         if self.pin_request and not self.python_code:

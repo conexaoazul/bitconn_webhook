@@ -4,6 +4,10 @@ import json
 import re
 import ast
 import time
+import gzip
+import zlib
+from urllib.parse import urlencode
+from lxml import etree
 
 
 class BitconnWebhookController(http.Controller):
@@ -38,6 +42,192 @@ class BitconnWebhookController(http.Controller):
             'values': {'name': 'Webhook Partner'},
         }
 
+    def _lenient_parse(self, text):
+        """Tenta fazer parsing JSON tolerante (vírgulas finais, aspas simples).
+        Retorna (data, error_msg) onde error_msg é None se sucesso."""
+        if not text:
+            return {}, None
+        # Primeiro: tentativa normal
+        try:
+            return json.loads(text), None
+        except Exception as e_first:
+            original_error = str(e_first)
+        work = text
+        # Remover BOM se existir
+        work = work.lstrip('\ufeff')
+        # Remover comentários simples // ou # (linha inteira)
+        work = '\n'.join([
+            ln for ln in work.splitlines()
+            if not ln.strip().startswith('//') and not ln.strip().startswith('#')
+        ])
+        # Remover vírgulas finais em objetos/arrays
+        work = re.sub(r",\s*([}\]])", r"\1", work)
+        # Converter aspas simples em chaves 'campo': -> "campo":
+        work = re.sub(r"'([A-Za-z0-9_\-]+)'\s*:", r'"\\1":', work)
+        # Converter strings de valores e arrays com aspas simples simples 'valor'
+        # Cuidado para não substituir dentro de aspas duplas já válidas
+        # Estratégia simples: substituir aspas simples que delimitam tokens alfanuméricos
+        work = re.sub(r":\s*'([^'\\]*)'", lambda m: ': "' + m.group(1).replace('"', '\\"') + '"', work)
+        work = re.sub(r"\[\s*'([^'\\]*)'", lambda m: '[ "' + m.group(1).replace('"', '\\"') + '"', work)
+        work = re.sub(r"'([^'\\]*)'\s*]", lambda m: '"' + m.group(1).replace('"', '\\"') + '"]', work)
+        # Strings internas em arrays separadas por vírgula
+        work = re.sub(r",\s*'([^'\\]*)'", lambda m: ', "' + m.group(1).replace('"', '\\"') + '"', work)
+        try:
+            return json.loads(work), None
+        except Exception:
+            # Último fallback: se o payload for só um dicionário python, tentar ast.literal_eval
+            try:
+                data = ast.literal_eval(text)
+                if isinstance(data, (dict, list)):
+                    return data, None
+            except Exception:
+                pass
+            return {}, 'invalid_json: %s' % original_error
+
+    def _decode_jsonish(self, val):
+        """Decodifica valores que claramente são JSON ({ ou [ no início).
+        Usado em urlencoded/multipart, onde campos chegam como string."""
+        if isinstance(val, str) and val and val[0] in '{[':
+            try:
+                return json.loads(val)
+            except Exception:
+                return val
+        return val
+
+    def _form_to_payload(self, form):
+        """Converte um MultiDict de form em dict.
+        Chaves repetidas viram lista. Valores que parecem JSON são decodificados.
+        (paridade n8n: sem coerção de tipos)"""
+        payload = {}
+        for key in form:
+            vals = form.getlist(key)
+            if len(vals) == 1:
+                payload[key] = self._decode_jsonish(vals[0])
+            else:
+                payload[key] = [self._decode_jsonish(v) for v in vals]
+        return payload
+
+    def _xml_to_dict(self, el):
+        """Converte um elemento lxml em dict/string recursivamente.
+        Atributos viram @nome, texto de nó com filhos vira #text,
+        tags repetidas viram lista."""
+        attrib = {'@%s' % k: v for k, v in (el.attrib or {}).items()}
+        children = list(el)
+        text = (el.text or '').strip()
+        if not children and not attrib:
+            return text
+        node = {}
+        if text:
+            node['#text'] = text
+        node.update(attrib)
+        for ch in children:
+            tag = ch.tag
+            val = self._xml_to_dict(ch)
+            if tag in node:
+                if isinstance(node[tag], list):
+                    node[tag].append(val)
+                else:
+                    node[tag] = [node[tag], val]
+            else:
+                node[tag] = val
+        return node
+
+    def _unwrap_xml_root(self, data):
+        """Se o XML tiver um único nó raiz contendo um único dict, desempacota."""
+        if isinstance(data, dict) and len(data) == 1:
+            only = list(data.values())[0]
+            if isinstance(only, dict):
+                return only
+        return data
+
+    def _parse_xml(self, raw_body):
+        """Converte XML em dict. Retorna (data, error_msg)."""
+        try:
+            root = etree.fromstring(raw_body.encode('utf-8'))
+            data = self._xml_to_dict(root)
+            if isinstance(data, dict):
+                data = self._unwrap_xml_root(data)
+            return data, None
+        except Exception as e:
+            return {}, 'invalid_xml: %s' % e
+
+    def _parse_body(self, mime, httprequest):
+        """Converte o body recebido em dict conforme o Content-Type.
+        Retorna (payload, parse_error, files, files_data, raw_body).
+        O Odoo já parseia form data (urlencoded/multipart) na dispatch via
+        get_http_params -> httprequest.form, o que consome o stream — por isso
+        usamos httprequest.form/files e reconstruímos o raw_body, em vez de get_data().
+        Demais content-types (json/xml/text/plain/octet-stream) usam get_data()
+        com suporte a gzip/deflate. application/octet-stream fica raw."""
+        files = {}
+        files_data = {}
+
+        if mime == 'multipart/form-data':
+            payload = self._form_to_payload(httprequest.form)
+            for key in httprequest.files:
+                f = httprequest.files[key]
+                meta = {
+                    'filename': getattr(f, 'filename', None),
+                    'content_type': getattr(f, 'content_type', None),
+                    'mimetype': getattr(f, 'mimetype', None),
+                    'size': None,
+                }
+                try:
+                    stream = getattr(f, 'stream', None)
+                    if stream is not None and getattr(stream, 'seek', None):
+                        old = stream.tell()
+                        stream.seek(0, 2)
+                        meta['size'] = stream.tell()
+                        stream.seek(old)
+                except Exception:
+                    pass
+                files[key] = meta
+                files_data[key] = f
+            return payload, None, files, files_data, ''
+
+        if mime == 'application/x-www-form-urlencoded':
+            # Stream já consumido pelo Odoo na dispatch: usa o form parseado
+            # e reconstrói o raw_body para request['body']/sample.
+            payload = self._form_to_payload(httprequest.form)
+            raw_body = urlencode(list(httprequest.form.lists()), doseq=True)
+            return payload, None, files, files_data, raw_body
+
+        enc = (httprequest.environ.get('HTTP_CONTENT_ENCODING') or '').lower()
+        data = b''
+        try:
+            data = httprequest.get_data() or b''
+        except Exception:
+            data = b''
+        parse_error = None
+        if enc == 'gzip' and data:
+            try:
+                data = gzip.decompress(data)
+            except Exception as e:
+                parse_error = 'invalid_encoding: %s' % e
+        elif enc == 'deflate' and data:
+            try:
+                data = zlib.decompress(data)
+            except Exception as e:
+                parse_error = 'invalid_encoding: %s' % e
+        raw_body = data.decode('utf-8', errors='replace')
+
+        if not raw_body:
+            return {}, parse_error, files, files_data, raw_body
+
+        if mime in ('application/json', 'text/json') or mime.endswith('+json'):
+            payload, err = self._lenient_parse(raw_body)
+            return payload, parse_error or err, files, files_data, raw_body
+        if mime.endswith('/xml') or mime.endswith('+xml'):
+            payload, err = self._parse_xml(raw_body)
+            return payload, parse_error or err, files, files_data, raw_body
+        if mime == 'text/plain':
+            payload, err = self._lenient_parse(raw_body)
+            if err:
+                payload = {'body': raw_body}
+            return payload, parse_error, files, files_data, raw_body
+        # application/octet-stream e demais: manter raw, sem conversão
+        return {}, parse_error, files, files_data, raw_body
+
     @http.route('/bitconn/webhook/<string:uuid_str>', type='http', auth='public', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], csrf=False)
     def receive(self, uuid_str, **kwargs):
         conf = self._resolve_conf(uuid_str)
@@ -70,73 +260,13 @@ class BitconnWebhookController(http.Controller):
                 'allowed_methods': allowed
             }, status=405)
         
-        raw_body = ''
-        try:
-            raw_body = request.httprequest.get_data(as_text=True) or ''
-        except Exception:
-            raw_body = ''
-        
-        # Don't save sample_request_payload here to avoid serialization conflicts
-        # It will be saved asynchronously or manually by user
+        content_type = request.httprequest.content_type or ''
+        mime = (content_type.split(';')[0] or '').strip().lower()
 
-        def _lenient_parse(text):
-            """Tenta fazer parsing JSON tolerante (vírgulas finais, aspas simples).
-            Retorna (data, error_msg) onde error_msg é None se sucesso."""
-            if not text:
-                return {}, None
-            # Primeiro: tentativa normal
-            try:
-                return json.loads(text), None
-            except Exception as e_first:
-                original_error = str(e_first)
-            work = text
-            # Remover BOM se existir
-            work = work.lstrip('\ufeff')
-            # Remover comentários simples // ou # (linha inteira)
-            work = '\n'.join([
-                ln for ln in work.splitlines()
-                if not ln.strip().startswith('//') and not ln.strip().startswith('#')
-            ])
-            # Remover vírgulas finais em objetos/arrays
-            work = re.sub(r",\s*([}\]])", r"\1", work)
-            # Converter aspas simples em chaves 'campo': -> "campo":
-            work = re.sub(r"'([A-Za-z0-9_\-]+)'\s*:", r'"\\1":', work)
-            # Converter strings de valores e arrays com aspas simples simples 'valor'
-            # Cuidado para não substituir dentro de aspas duplas já válidas
-            # Estratégia simples: substituir aspas simples que delimitam tokens alfanuméricos
-            work = re.sub(r":\s*'([^'\\]*)'", lambda m: ': "' + m.group(1).replace('"', '\\"') + '"', work)
-            work = re.sub(r"\[\s*'([^'\\]*)'", lambda m: '[ "' + m.group(1).replace('"', '\\"') + '"', work)
-            work = re.sub(r"'([^'\\]*)'\s*]", lambda m: '"' + m.group(1).replace('"', '\\"') + '"]', work)
-            # Strings internas em arrays separadas por vírgula
-            work = re.sub(r",\s*'([^'\\]*)'", lambda m: ', "' + m.group(1).replace('"', '\\"') + '"', work)
-            try:
-                return json.loads(work), None
-            except Exception:
-                # Último fallback: se o payload for só um dicionário python, tentar ast.literal_eval
-                try:
-                    data = ast.literal_eval(text)
-                    if isinstance(data, (dict, list)):
-                        return data, None
-                except Exception:
-                    pass
-                return {}, f'invalid_json: {original_error}'
-
-        payload = {}
-        parse_error = None
-        if raw_body:
-            data, err = _lenient_parse(raw_body)
-            payload = data or {}
-            parse_error = err
-        else:
-            # fallback para método padrão (deve ser vazio se não era JSON)
-            try:
-                payload = request.get_json_data() or {}
-            except Exception as e_json_std:
-                parse_error = f'invalid_json: {e_json_std}'
-
-        # Se houve erro de parsing e não conseguimos extrair nada significativo
-        if parse_error and not payload:
-            return request.make_json_response({'ok': False, 'error': 'invalid_json', 'detail': parse_error}, status=400)
+        # Converte o body em dict conforme o Content-Type.
+        # Todo formato textual (json, urlencoded, multipart, xml, text/plain) vira dict.
+        # Multipart não lê get_data(); gzip/deflate são descomprimidos antes do parse.
+        payload, parse_error, files, files_data, raw_body = self._parse_body(mime, request.httprequest)
 
         # Normalizar campo 'fields' se veio em formato de string tipo Python: "['id','name',]"
         fields = payload.get('fields')
@@ -157,6 +287,18 @@ class BitconnWebhookController(http.Controller):
         offset = payload.get('offset') or 0
         order = payload.get('order')
         ids = payload.get('ids')
+
+        # No modo código não bloqueamos por formato: o parse nunca aborta o request,
+        # o conteúdo chega via request['json']/request['body'] e o código decide.
+        is_code_request = conf.can_code and (
+            method == 'code'
+            or (not model and conf.pin_request)
+            or (not model and conf.python_code)
+        )
+
+        # Se houve erro de parsing e não conseguimos extrair nada significativo
+        if parse_error and not payload and not is_code_request:
+            return request.make_json_response({'ok': False, 'error': 'invalid_json', 'detail': parse_error}, status=400)
 
         if method == 'default_payload':
             # echo current headers to ease client config
@@ -189,11 +331,9 @@ class BitconnWebhookController(http.Controller):
                     'body': raw_body,
                     'headers': dict(request.httprequest.headers),
                     'method': request.httprequest.method,
+                    'content_type': content_type,
                 }
-                try:
-                    request_obj['json'] = json.loads(raw_body)
-                except:
-                    request_obj['json'] = {}
+                request_obj['json'] = payload if isinstance(payload, dict) else {}
                 
                 # Convert to JSON string
                 sample_data = json.dumps(request_obj, indent=2, ensure_ascii=False)[:10000]
@@ -235,12 +375,17 @@ class BitconnWebhookController(http.Controller):
         
         # Check if custom code execution is enabled (doesn't require model)
         # If can_code is enabled and method is 'code', OR if no model provided and can_code is enabled
-        if conf.can_code and (method == 'code' or (not model and conf.pin_request) or (not model and conf.python_code)):
+        if is_code_request:
             _start = time.time()
             res = conf._exec_code(
-                raw_body, 
+                raw_body,
                 request_headers=dict(request.httprequest.headers),
-                request_method=request.httprequest.method
+                request_method=request.httprequest.method,
+                content_type=content_type,
+                parsed_payload=payload,
+                parse_error=parse_error,
+                files=files,
+                files_data=files_data,
             )
             status = 200 if res.get('ok') else 400
 
@@ -248,10 +393,12 @@ class BitconnWebhookController(http.Controller):
                 direction='inbound',
                 state='success' if res.get('ok') else 'error',
                 input_data=raw_body,
+                execution_data=conf.python_code,
                 output_data=json.dumps(res, indent=2, ensure_ascii=False),
                 error_message=res.get('error') or res.get('reason'),
                 http_method=http_method,
                 http_status=status,
+                content_type=content_type,
                 method='code',
                 duration=time.time() - _start,
             )
@@ -288,10 +435,12 @@ class BitconnWebhookController(http.Controller):
             direction='inbound',
             state='success' if res.get('ok') else 'error',
             input_data=raw_body,
+            execution_data=f"[{method}] {model} | {content_type or '-'}",
             output_data=json.dumps(res, indent=2, ensure_ascii=False),
             error_message=res.get('error') or res.get('reason'),
             http_method=http_method,
             http_status=status,
+            content_type=content_type,
             model_name=model,
             method=method,
             duration=time.time() - _start,

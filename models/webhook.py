@@ -5,6 +5,9 @@ import secrets
 import json
 import logging
 import builtins
+import hashlib
+import hmac
+import time
 
 _logger = logging.getLogger(__name__)
 
@@ -28,11 +31,13 @@ class BitconnWebhook(models.Model):
     # Inbound Authentication Configuration
     inbound_auth_type = fields.Selection([
         ('none', 'None - Public Access'),
-        ('header', 'Header Authentication (Bearer/API Key)')
+        ('header', 'Header Authentication (Bearer/API Key)'),
+        ('chatwoot_hmac', 'Chatwoot HMAC-SHA256')
     ], string='Inbound Authentication', default='header', required=True, 
        help='Authentication type for incoming webhooks:\n'
             '• None: Public access without authentication (use with caution!)\n'
-            '• Header: Requires Bearer token or API key in request headers',
+            '• Header: Requires Bearer token or API key in request headers\n'
+            '• Chatwoot HMAC: Validates X-Chatwoot-Signature over timestamp + raw body',
        tracking=True)
 
     # Sensitive fields: avoid standard tracking to prevent exposing full values; custom masked logging in write()
@@ -527,19 +532,14 @@ result = {'ok': True, 'message': 'Code executed successfully'}"""
             # If any CRUD operation is enabled, disable code execution
             self.can_code = False
 
-    # Helpers to validate incoming headers
+    # Helpers to validate inbound authentication
     def _check_header(self, headers):
-        """Validate authentication based on configured inbound_auth_type.
-        Returns True if authentication is valid or not required.
-        """
+        """Validate legacy Bearer/API-key header authentication."""
         self.ensure_one()
-        
-        # If authentication is disabled (none), always allow access
         if self.inbound_auth_type == 'none':
             return True
-        
-        # Header authentication (original behavior)
-        # Prefer standard Authorization: Bearer <token>
+        if self.inbound_auth_type != 'header':
+            return False
         auth = headers.get('Authorization') or headers.get('authorization')
         incoming_token = None
         if auth and isinstance(auth, str) and auth.lower().startswith('bearer '):
@@ -547,17 +547,53 @@ result = {'ok': True, 'message': 'Code executed successfully'}"""
                 incoming_token = auth.split(' ', 1)[1].strip()
             except Exception:
                 incoming_token = None
-        # Fallback headers (no X- prefix required; accept X-Webhook-Key for backwards compatibility)
         if not incoming_token:
             incoming_token = headers.get('Webhook-Key') or headers.get('webhook_key') or headers.get('X-Webhook-Key')
         if not incoming_token:
             return False
-        # Constant-time comparison
+        return hmac.compare_digest(incoming_token, self.secret_key or '')
+
+    def _check_chatwoot_hmac(self, headers, raw_body):
+        """Validate Chatwoot HMAC-SHA256 against the exact raw request body."""
+        self.ensure_one()
+        signature = headers.get('X-Chatwoot-Signature')
+        timestamp = headers.get('X-Chatwoot-Timestamp')
+        if not signature or not timestamp or not self.secret_key:
+            return False
         try:
-            from secrets import compare_digest
-            return compare_digest(incoming_token, self.secret_key or '')
-        except Exception:
-            return incoming_token == (self.secret_key or '')
+            timestamp_int = int(timestamp)
+        except (TypeError, ValueError):
+            return False
+
+        try:
+            tolerance = int(self.env['ir.config_parameter'].sudo().get_param(
+                'bitconn_webhook.chatwoot_hmac_tolerance_seconds', '300'
+            ))
+        except (TypeError, ValueError):
+            tolerance = 300
+        tolerance = max(0, tolerance)
+        if tolerance and abs(int(time.time()) - timestamp_int) > tolerance:
+            return False
+
+        if isinstance(raw_body, str):
+            raw_body = raw_body.encode('utf-8')
+        raw_body = raw_body or b''
+        signed = str(timestamp).encode('ascii') + b'.' + raw_body
+        expected = 'sha256=' + hmac.new(
+            (self.secret_key or '').encode('utf-8'),
+            signed,
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, str(signature))
+
+    def _check_inbound_auth(self, headers, raw_body=b''):
+        """Validate configured inbound authentication without executing business logic."""
+        self.ensure_one()
+        if self.inbound_auth_type == 'none':
+            return True
+        if self.inbound_auth_type == 'chatwoot_hmac':
+            return self._check_chatwoot_hmac(headers, raw_body)
+        return self._check_header(headers)
 
     def _can_access_model(self, model_name):
         self.ensure_one()

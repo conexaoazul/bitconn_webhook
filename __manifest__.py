@@ -20,7 +20,7 @@ Security:
 
 See README.md for full documentation & examples (n8n workflows, advanced specs, troubleshooting).
 """,
-    'version': '19.0.1.5.0',
+    'version': '19.0.1.6.0',
     'category': 'Tools',
     'author': 'Bitconn Technology',
     'website': 'https://bitconn.com.br',

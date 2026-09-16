@@ -17,7 +17,15 @@ class BitconnWebhookController(http.Controller):
 
     def _validate(self, conf):
         headers = request.httprequest.headers
-        return conf._check_header(headers)
+        raw_body = b''
+        if conf.inbound_auth_type == 'chatwoot_hmac':
+            try:
+                # Werkzeug caches get_data() by default, so parsing later sees
+                # the exact same bytes used to validate Chatwoot's signature.
+                raw_body = request.httprequest.get_data(cache=True) or b''
+            except Exception:
+                return False
+        return conf._check_inbound_auth(headers, raw_body)
 
     def _save_sample_async(self, webhook_id, raw_body):
         """Save sample request asynchronously after commit"""
